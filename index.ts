@@ -1,16 +1,27 @@
 import express, { Request, Response } from 'express'
 import { createServer } from 'http'
 import { Server } from 'socket.io'
+import { PeerServer } from 'peer'
 import cors from 'cors'
 import { Chat, Message, User } from './types'
 
 const app = express()
-app.use(cors(), express.json())
+app.use(cors())
+app.use(express.json({ limit: '50mb' }))
+app.use(express.urlencoded({ limit: '50mb', extended: true }))
 
 const server = createServer(app)
 
+// Настройка Socket.IO
 const io = new Server(server, {
     cors: { origin: '*' }
+})
+
+// Настройка PeerJS сервера
+const peerServer = PeerServer({
+    port: 3001,
+    path: '/peerjs',
+    allow_discovery: true
 })
 
 app.set('io', io)
@@ -20,7 +31,6 @@ const users: User[] = []
 // Хранилище активных звонков
 interface ActiveCall {
     callId: string
-    roomId: string
     fromUserId: number
     toUserId: number
     chatId: number
@@ -48,6 +58,7 @@ const generateCallId = (): string => {
     return `call_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
 }
 
+// API endpoints
 app.get('/users', (_, res: Response) => res.json(users))
 
 app.get('/user/:id', (req: Request, res: Response) => {
@@ -452,12 +463,11 @@ app.delete('/message/delete/all-only-me', (req: Request, res: Response) => {
     res.json({ message: 'Ошибка при удалении сообщений!' })
 })
 
-// WebRTC сигнализация и управление звонками
+// Socket.IO с сигнализацией для PeerJS
 io.on('connection', (socket) => {
     console.log('Client connected:', socket.id)
 
     let currentUserId: number | null = null
-    let currentCallRoom: string | null = null
 
     socket.on('user-connected', (userId: number) => {
         currentUserId = userId
@@ -501,37 +511,21 @@ io.on('connection', (socket) => {
         }
     })
     
-    // ============ WEBRTC ЗВОНКИ ДЛЯ ЛИЧНЫХ ЧАТОВ ============
+    // ============ PEERJS ЗВОНКИ ============
     
-    // Инициация звонка
+    // Инициация звонка через PeerJS
     socket.on('call-user', (data: {
+        callId: string,
         from: number,
         to: number,
         chatId: number,
-        isVideo: boolean
+        isVideo: boolean,
+        peerId: string
     }) => {
-        console.log(`📞 Call from ${data.from} to ${data.to}, video: ${data.isVideo}`)
+        console.log(`📞 PeerJS call from ${data.from} to ${data.to}, video: ${data.isVideo}`)
         
-        // Проверяем, не занят ли пользователь
-        const existingCall = Array.from(activeCalls.values()).find(
-            call => (call.toUserId === data.to && call.status === 'active') ||
-                   (call.fromUserId === data.to && call.status === 'active')
-        )
-        
-        if (existingCall) {
-            socket.emit('call-busy', {
-                message: 'User is already in a call',
-                to: data.to
-            })
-            return
-        }
-        
-        const callId = generateCallId()
-        const roomId = `call_${callId}`
-        
-        const activeCall: ActiveCall = {
-            callId,
-            roomId,
+        const call: ActiveCall = {
+            callId: data.callId,
             fromUserId: data.from,
             toUserId: data.to,
             chatId: data.chatId,
@@ -540,58 +534,47 @@ io.on('connection', (socket) => {
             status: 'ringing'
         }
         
-        activeCalls.set(callId, activeCall)
+        activeCalls.set(data.callId, call)
         
-        // Отправляем входящий звонок получателю
+        // Отправляем получателю информацию о звонке с PeerId звонящего
         io.to(`user:${data.to}`).emit('incoming-call', {
-            callId,
+            callId: data.callId,
             from: data.from,
             chatId: data.chatId,
             isVideo: data.isVideo,
-            roomId
+            fromPeerId: data.peerId
         })
         
         // Таймаут для неотвеченного звонка
         setTimeout(() => {
-            const call = activeCalls.get(callId)
-            if (call && call.status === 'ringing') {
-                call.status = 'ended'
-                activeCalls.delete(callId)
+            const activeCall = activeCalls.get(data.callId)
+            if (activeCall && activeCall.status === 'ringing') {
+                activeCall.status = 'ended'
+                activeCalls.delete(data.callId)
                 io.to(`user:${data.from}`).emit('call-timeout', {
-                    callId,
-                    chatId: data.chatId
-                })
-                io.to(`user:${data.to}`).emit('call-timeout', {
-                    callId,
+                    callId: data.callId,
                     chatId: data.chatId
                 })
             }
-        }, 30000) // 30 секунд на ответ
+        }, 30000)
     })
     
     // Принятие звонка
     socket.on('answer-call', (data: {
         callId: string,
-        from: number,
         to: number,
-        chatId: number
+        chatId: number,
+        peerId: string
     }) => {
-        console.log(`✅ Call ${data.callId} answered by ${data.to}`)
+        console.log(`✅ PeerJS call ${data.callId} answered by ${data.to}`)
         
         const call = activeCalls.get(data.callId)
         if (call && call.status === 'ringing') {
             call.status = 'active'
-            currentCallRoom = call.roomId
-            socket.join(call.roomId)
-            
-            io.to(`user:${data.from}`).emit('call-answered', {
+            io.to(`user:${call.fromUserId}`).emit('call-answered', {
                 callId: data.callId,
-                chatId: data.chatId
-            })
-            
-            io.to(`user:${data.to}`).emit('call-connected', {
-                callId: data.callId,
-                chatId: data.chatId
+                chatId: data.chatId,
+                peerId: data.peerId
             })
         }
     })
@@ -599,58 +582,20 @@ io.on('connection', (socket) => {
     // Отклонение звонка
     socket.on('reject-call', (data: {
         callId: string,
-        from: number,
         to: number,
         chatId: number
     }) => {
-        console.log(`❌ Call ${data.callId} rejected by ${data.to}`)
+        console.log(`❌ PeerJS call ${data.callId} rejected by ${data.to}`)
         
         const call = activeCalls.get(data.callId)
         if (call) {
             call.status = 'ended'
             activeCalls.delete(data.callId)
-            
-            io.to(`user:${data.from}`).emit('call-rejected', {
+            io.to(`user:${call.fromUserId}`).emit('call-rejected', {
                 callId: data.callId,
                 chatId: data.chatId
             })
         }
-    })
-    
-    // WebRTC сигнальные сообщения
-    socket.on('webrtc-offer', (data: {
-        callId: string,
-        to: number,
-        offer: RTCSessionDescriptionInit
-    }) => {
-        console.log(`📡 Sending WebRTC offer for call ${data.callId} to user ${data.to}`)
-        socket.to(`user:${data.to}`).emit('webrtc-offer', {
-            callId: data.callId,
-            offer: data.offer
-        })
-    })
-    
-    socket.on('webrtc-answer', (data: {
-        callId: string,
-        to: number,
-        answer: RTCSessionDescriptionInit
-    }) => {
-        console.log(`📡 Sending WebRTC answer for call ${data.callId} to user ${data.to}`)
-        socket.to(`user:${data.to}`).emit('webrtc-answer', {
-            callId: data.callId,
-            answer: data.answer
-        })
-    })
-    
-    socket.on('webrtc-ice-candidate', (data: {
-        callId: string,
-        to: number,
-        candidate: RTCIceCandidateInit
-    }) => {
-        socket.to(`user:${data.to}`).emit('webrtc-ice-candidate', {
-            callId: data.callId,
-            candidate: data.candidate
-        })
     })
     
     // Завершение звонка
@@ -659,55 +604,20 @@ io.on('connection', (socket) => {
         chatId: number,
         userId: number
     }) => {
-        console.log(`🔚 Ending call ${data.callId} by user ${data.userId}`)
+        console.log(`🔚 Ending PeerJS call ${data.callId} by user ${data.userId}`)
         
         const call = activeCalls.get(data.callId)
         if (call) {
             call.status = 'ended'
             const otherUserId = call.fromUserId === data.userId ? call.toUserId : call.fromUserId
-            
-            // Уведомляем другого участника
             io.to(`user:${otherUserId}`).emit('call-ended', {
                 callId: data.callId,
                 chatId: data.chatId,
                 endedBy: data.userId
             })
-            
-            // Уведомляем инициатора
-            io.to(`user:${data.userId}`).emit('call-ended', {
-                callId: data.callId,
-                chatId: data.chatId,
-                endedBy: data.userId
-            })
-            
-            // Очищаем комнату
-            if (call.roomId) {
-                io.socketsLeave(call.roomId)
-            }
-            
             activeCalls.delete(data.callId)
         }
     })
-    
-    // Получение информации о звонке
-    socket.on('get-call-info', (data: { userId: number }, callback: (info: any) => void) => {
-        const activeCall = Array.from(activeCalls.values()).find(
-            call => call.fromUserId === data.userId || call.toUserId === data.userId
-        )
-        
-        if (activeCall && activeCall.status === 'active') {
-            callback({
-                inCall: true,
-                callId: activeCall.callId,
-                with: activeCall.fromUserId === data.userId ? activeCall.toUserId : activeCall.fromUserId,
-                isVideo: activeCall.isVideo
-            })
-        } else {
-            callback({ inCall: false })
-        }
-    })
-    
-    // ============ КОНЕЦ WEBRTC СИСТЕМЫ ============
     
     // Heartbeat
     let heartbeatInterval: NodeJS.Timeout
@@ -726,9 +636,7 @@ io.on('connection', (socket) => {
         }
     }
     
-    socket.on('pong', () => {
-        // Получен heartbeat
-    })
+    socket.on('pong', () => {})
     
     startHeartbeat()
     
@@ -747,7 +655,7 @@ io.on('connection', (socket) => {
                 })
             }
             
-            // Завершаем все активные звонки пользователя
+            // Завершаем активные звонки пользователя
             const userCalls = Array.from(activeCalls.values()).filter(
                 call => call.fromUserId === currentUserId || call.toUserId === currentUserId
             )
@@ -766,4 +674,11 @@ io.on('connection', (socket) => {
     })
 })
 
-server.listen(3000, () => console.log('Server is running on port 3000'))
+// Запуск серверов
+const HTTP_PORT = 3000
+const PEER_PORT = 3001
+
+server.listen(HTTP_PORT, () => {
+    console.log(`HTTP Server running on port ${HTTP_PORT}`)
+    console.log(`PeerJS Server running on port ${PEER_PORT}`)
+})
