@@ -1,5 +1,5 @@
 import express, { Request, Response } from 'express'
-import { createServer } from 'http'
+import { createServer } from 'https'
 import { Server } from 'socket.io'
 import cors from 'cors'
 import { Chat, Message, User } from './types'
@@ -17,6 +17,20 @@ app.set('io', io)
 
 const users: User[] = []
 
+// Хранилище активных звонков
+interface ActiveCall {
+    callId: string
+    roomId: string
+    fromUserId: number
+    toUserId: number
+    chatId: number
+    isVideo: boolean
+    startTime: Date
+    status: 'ringing' | 'active' | 'ended'
+}
+
+const activeCalls = new Map<string, ActiveCall>()
+
 const generateId = (): number => {
     const now = new Date()
     const hours = String(now.getHours()).padStart(2, '0')
@@ -28,6 +42,10 @@ const generateId = (): number => {
     const year = now.getFullYear()
     
     return Number(`${hours}${minutes}${seconds}${milliseconds}${day}${month}${year}`)
+}
+
+const generateCallId = (): string => {
+    return `call_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
 }
 
 app.get('/users', (_, res: Response) => res.json(users))
@@ -206,7 +224,7 @@ app.delete('/chat/delete/group', (req: Request, res: Response) => {
 })
 
 app.post('/message/create/no-group', (req: Request, res: Response) => {
-    const { userId, chatId, text } = req.body
+    const { userId, chatId, text, photo, video, audio } = req.body
 
     const user = users.find(u => u.id === userId)
     
@@ -221,7 +239,10 @@ app.post('/message/create/no-group', (req: Request, res: Response) => {
                     avatar: user.avatar,
                     name: user.name
                 },
-                text: text,
+                text,
+                photo,
+                video,
+                audio,
                 time: new Date().toLocaleTimeString()
             }
             
@@ -241,7 +262,7 @@ app.post('/message/create/no-group', (req: Request, res: Response) => {
             }
             
             io.to(`user:${user.id}`).emit('new-message', {
-                chatId: chatId,
+                chatId,
                 message: newMessage
             })
             
@@ -253,7 +274,7 @@ app.post('/message/create/no-group', (req: Request, res: Response) => {
 })
 
 app.post('/message/create/group', (req: Request, res: Response) => {
-    const { userId, chatId, text } = req.body
+    const { userId, chatId, text, photo, video, audio } = req.body
 
     const user = users.find(u => u.id === userId)
     
@@ -268,7 +289,10 @@ app.post('/message/create/group', (req: Request, res: Response) => {
                     avatar: user.avatar,
                     name: user.name
                 },
-                text: text,
+                text,
+                photo,
+                video,
+                audio,
                 time: new Date().toLocaleTimeString()
             }
             
@@ -282,7 +306,7 @@ app.post('/message/create/group', (req: Request, res: Response) => {
                         userChat.messages.push(newMessage)
                     }
                     io.to(`user:${participant.id}`).emit('new-message', {
-                        chatId: chatId,
+                        chatId,
                         message: newMessage
                     })
                 }
@@ -428,7 +452,7 @@ app.delete('/message/delete/all-only-me', (req: Request, res: Response) => {
     res.json({ message: 'Ошибка при удалении сообщений!' })
 })
 
-// Socket.IO с системой звонков
+// WebRTC сигнализация и управление звонками
 io.on('connection', (socket) => {
     console.log('Client connected:', socket.id)
 
@@ -477,92 +501,213 @@ io.on('connection', (socket) => {
         }
     })
     
-    // ============ СИСТЕМА ЗВОНКОВ ============
+    // ============ WEBRTC ЗВОНКИ ДЛЯ ЛИЧНЫХ ЧАТОВ ============
     
-    // Начало звонка
-    socket.on('start-call', (data: { 
-        from: number, 
-        to: number, 
+    // Инициация звонка
+    socket.on('call-user', (data: {
+        from: number,
+        to: number,
         chatId: number,
-        isVideo: boolean,
-        roomId: string 
+        isVideo: boolean
     }) => {
-        console.log(`Call from ${data.from} to ${data.to}, video: ${data.isVideo}`)
-        currentCallRoom = data.roomId
-        socket.join(data.roomId)
+        console.log(`📞 Call from ${data.from} to ${data.to}, video: ${data.isVideo}`)
         
-        socket.to(`user:${data.to}`).emit('incoming-call', {
+        // Проверяем, не занят ли пользователь
+        const existingCall = Array.from(activeCalls.values()).find(
+            call => (call.toUserId === data.to && call.status === 'active') ||
+                   (call.fromUserId === data.to && call.status === 'active')
+        )
+        
+        if (existingCall) {
+            socket.emit('call-busy', {
+                message: 'User is already in a call',
+                to: data.to
+            })
+            return
+        }
+        
+        const callId = generateCallId()
+        const roomId = `call_${callId}`
+        
+        const activeCall: ActiveCall = {
+            callId,
+            roomId,
+            fromUserId: data.from,
+            toUserId: data.to,
+            chatId: data.chatId,
+            isVideo: data.isVideo,
+            startTime: new Date(),
+            status: 'ringing'
+        }
+        
+        activeCalls.set(callId, activeCall)
+        
+        // Отправляем входящий звонок получателю
+        io.to(`user:${data.to}`).emit('incoming-call', {
+            callId,
             from: data.from,
             chatId: data.chatId,
             isVideo: data.isVideo,
-            roomId: data.roomId
+            roomId
         })
+        
+        // Таймаут для неотвеченного звонка
+        setTimeout(() => {
+            const call = activeCalls.get(callId)
+            if (call && call.status === 'ringing') {
+                call.status = 'ended'
+                activeCalls.delete(callId)
+                io.to(`user:${data.from}`).emit('call-timeout', {
+                    callId,
+                    chatId: data.chatId
+                })
+                io.to(`user:${data.to}`).emit('call-timeout', {
+                    callId,
+                    chatId: data.chatId
+                })
+            }
+        }, 30000) // 30 секунд на ответ
     })
     
-    // Присоединение к звонку
-    socket.on('join-call', (data: { 
-        userId: number, 
-        chatId: number,
-        roomId: string 
+    // Принятие звонка
+    socket.on('answer-call', (data: {
+        callId: string,
+        from: number,
+        to: number,
+        chatId: number
     }) => {
-        console.log(`User ${data.userId} joined call room ${data.roomId}`)
-        socket.join(data.roomId)
-        socket.to(data.roomId).emit('user-joined-call', {
-            userId: data.userId
-        })
-    })
-    
-    // Передача аудио данных
-    socket.on('audio-data', (data: { 
-        roomId: string, 
-        audioData: ArrayBuffer,
-        userId: number 
-    }) => {
-        socket.to(data.roomId).emit('audio-data', {
-            audioData: data.audioData,
-            userId: data.userId
-        })
-    })
-    
-    // Передача видео данных
-    socket.on('video-data', (data: { 
-        roomId: string, 
-        videoData: ArrayBuffer,
-        userId: number 
-    }) => {
-        socket.to(data.roomId).emit('video-data', {
-            videoData: data.videoData,
-            userId: data.userId
-        })
+        console.log(`✅ Call ${data.callId} answered by ${data.to}`)
+        
+        const call = activeCalls.get(data.callId)
+        if (call && call.status === 'ringing') {
+            call.status = 'active'
+            currentCallRoom = call.roomId
+            socket.join(call.roomId)
+            
+            io.to(`user:${data.from}`).emit('call-answered', {
+                callId: data.callId,
+                chatId: data.chatId
+            })
+            
+            io.to(`user:${data.to}`).emit('call-connected', {
+                callId: data.callId,
+                chatId: data.chatId
+            })
+        }
     })
     
     // Отклонение звонка
-    socket.on('reject-call', (data: { 
-        to: number, 
-        chatId: number 
+    socket.on('reject-call', (data: {
+        callId: string,
+        from: number,
+        to: number,
+        chatId: number
     }) => {
-        console.log(`Call rejected by ${data.to}`)
-        socket.to(`user:${data.to}`).emit('call-rejected', {
-            chatId: data.chatId
+        console.log(`❌ Call ${data.callId} rejected by ${data.to}`)
+        
+        const call = activeCalls.get(data.callId)
+        if (call) {
+            call.status = 'ended'
+            activeCalls.delete(data.callId)
+            
+            io.to(`user:${data.from}`).emit('call-rejected', {
+                callId: data.callId,
+                chatId: data.chatId
+            })
+        }
+    })
+    
+    // WebRTC сигнальные сообщения
+    socket.on('webrtc-offer', (data: {
+        callId: string,
+        to: number,
+        offer: RTCSessionDescriptionInit
+    }) => {
+        console.log(`📡 Sending WebRTC offer for call ${data.callId} to user ${data.to}`)
+        socket.to(`user:${data.to}`).emit('webrtc-offer', {
+            callId: data.callId,
+            offer: data.offer
+        })
+    })
+    
+    socket.on('webrtc-answer', (data: {
+        callId: string,
+        to: number,
+        answer: RTCSessionDescriptionInit
+    }) => {
+        console.log(`📡 Sending WebRTC answer for call ${data.callId} to user ${data.to}`)
+        socket.to(`user:${data.to}`).emit('webrtc-answer', {
+            callId: data.callId,
+            answer: data.answer
+        })
+    })
+    
+    socket.on('webrtc-ice-candidate', (data: {
+        callId: string,
+        to: number,
+        candidate: RTCIceCandidateInit
+    }) => {
+        socket.to(`user:${data.to}`).emit('webrtc-ice-candidate', {
+            callId: data.callId,
+            candidate: data.candidate
         })
     })
     
     // Завершение звонка
-    socket.on('end-call', (data: { 
-        roomId: string, 
-        chatId: number 
+    socket.on('end-call', (data: {
+        callId: string,
+        chatId: number,
+        userId: number
     }) => {
-        console.log(`Call ended in room ${data.roomId}`)
-        if (data.roomId) {
-            socket.to(data.roomId).emit('call-ended', {
-                chatId: data.chatId
+        console.log(`🔚 Ending call ${data.callId} by user ${data.userId}`)
+        
+        const call = activeCalls.get(data.callId)
+        if (call) {
+            call.status = 'ended'
+            const otherUserId = call.fromUserId === data.userId ? call.toUserId : call.fromUserId
+            
+            // Уведомляем другого участника
+            io.to(`user:${otherUserId}`).emit('call-ended', {
+                callId: data.callId,
+                chatId: data.chatId,
+                endedBy: data.userId
             })
-            socket.leave(data.roomId)
+            
+            // Уведомляем инициатора
+            io.to(`user:${data.userId}`).emit('call-ended', {
+                callId: data.callId,
+                chatId: data.chatId,
+                endedBy: data.userId
+            })
+            
+            // Очищаем комнату
+            if (call.roomId) {
+                io.socketsLeave(call.roomId)
+            }
+            
+            activeCalls.delete(data.callId)
         }
-        currentCallRoom = null
     })
     
-    // ============ КОНЕЦ СИСТЕМЫ ЗВОНКОВ ============
+    // Получение информации о звонке
+    socket.on('get-call-info', (data: { userId: number }, callback: (info: any) => void) => {
+        const activeCall = Array.from(activeCalls.values()).find(
+            call => call.fromUserId === data.userId || call.toUserId === data.userId
+        )
+        
+        if (activeCall && activeCall.status === 'active') {
+            callback({
+                inCall: true,
+                callId: activeCall.callId,
+                with: activeCall.fromUserId === data.userId ? activeCall.toUserId : activeCall.fromUserId,
+                isVideo: activeCall.isVideo
+            })
+        } else {
+            callback({ inCall: false })
+        }
+    })
+    
+    // ============ КОНЕЦ WEBRTC СИСТЕМЫ ============
     
     // Heartbeat
     let heartbeatInterval: NodeJS.Timeout
@@ -582,7 +727,7 @@ io.on('connection', (socket) => {
     }
     
     socket.on('pong', () => {
-        console.log(`Heartbeat received from ${socket.id}`)
+        // Получен heartbeat
     })
     
     startHeartbeat()
@@ -601,11 +746,21 @@ io.on('connection', (socket) => {
                     isOnline: false
                 })
             }
-        }
-        
-        if (currentCallRoom) {
-            io.to(currentCallRoom).emit('call-ended', {
-                chatId: null
+            
+            // Завершаем все активные звонки пользователя
+            const userCalls = Array.from(activeCalls.values()).filter(
+                call => call.fromUserId === currentUserId || call.toUserId === currentUserId
+            )
+            
+            userCalls.forEach(call => {
+                const otherUserId = call.fromUserId === currentUserId ? call.toUserId : call.fromUserId
+                io.to(`user:${otherUserId}`).emit('call-ended', {
+                    callId: call.callId,
+                    chatId: call.chatId,
+                    endedBy: currentUserId,
+                    reason: 'disconnected'
+                })
+                activeCalls.delete(call.callId)
             })
         }
     })

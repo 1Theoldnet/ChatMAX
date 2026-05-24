@@ -41,5 +41,8 @@ export type Message = {
         name: string
     }
     text: string
+    photo: string
+    video: string
+    audio: string
     time: string
 }
