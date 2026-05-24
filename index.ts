@@ -637,6 +637,32 @@ io.on('connection', (socket) => {
     }
     
     socket.on('pong', () => {})
+
+    // Добавьте обработчики для PeerJS сигналов
+socket.on('peer-call-initiated', (data) => {
+    const { from, to, chatId, isVideo } = data
+    io.to(`user:${to}`).emit('incoming-call', {
+        from,
+        chatId,
+        isVideo,
+        fromPeerId: users.find(u => u.id === from)?.peerId
+    })
+})
+
+socket.on('peer-call-answered', (data) => {
+    const { to, chatId } = data
+    io.to(`user:${to}`).emit('call-answered', { chatId })
+})
+
+socket.on('peer-call-rejected', (data) => {
+    const { to, chatId } = data
+    io.to(`user:${to}`).emit('call-rejected', { chatId })
+})
+
+socket.on('peer-call-ended', (data) => {
+    const { chatId, userId } = data
+    io.emit('call-ended', { chatId, endedBy: userId })
+})
     
     startHeartbeat()
     
