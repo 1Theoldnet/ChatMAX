@@ -1,5 +1,5 @@
 import express, { Request, Response } from 'express'
-import { createServer } from 'https'
+import { createServer } from 'http'
 import { Server } from 'socket.io'
 import { PeerServer } from 'peer'
 import cors from 'cors'
