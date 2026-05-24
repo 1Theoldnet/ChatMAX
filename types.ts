@@ -6,6 +6,7 @@ export type User = {
     description: string
     isOnline: boolean
     chats: Chat[]
+    peerId?: string
 }
 
 export type Chat = {
